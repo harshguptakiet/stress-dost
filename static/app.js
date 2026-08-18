@@ -1048,6 +1048,8 @@ const StressTriggers = (() => {
       requestFeedbackPulse: () => {},
       isScreenBusyForPopup: () => false,
       onQuestionRendered: () => {},
+      startPersistentDistraction: () => {},
+      stopPersistentDistraction: () => {},
     };
   }
 
@@ -4199,6 +4201,257 @@ const StressTriggers = (() => {
     }, dismissMs);
   }
 
+  // ── Persistent distraction layer ───────────────────────────────────
+  // The warning popup zooms the image in. On dismiss it does NOT disappear:
+  // it docks (FLIP animation) to a screen slot and keeps living there —
+  // drifting between anchors, breathing, and pulsing — until the student
+  // submits the answer or the question changes.
+  const _dstr = {
+    wash: null,
+    float: null,
+    inner: null,
+    caption: null,
+    timers: [],
+    resizeHandler: null,
+    questionId: null,
+    startedAt: 0,
+    anchorIdx: -1,
+    moveCount: 0,
+    captions: [],
+    baseW: 260,
+    baseH: 180,
+    reduced: false,
+  };
+
+  function _clearDistractionTimers() {
+    _dstr.timers.forEach((id) => { clearTimeout(id); clearInterval(id); });
+    _dstr.timers = [];
+  }
+
+  function stopPersistentDistraction() {
+    _clearDistractionTimers();
+    if (_dstr.resizeHandler) {
+      window.removeEventListener("resize", _dstr.resizeHandler);
+      _dstr.resizeHandler = null;
+    }
+    [_dstr.wash, _dstr.float].forEach((el) => {
+      if (!el) return;
+      el.style.transition = "opacity 380ms ease";
+      el.style.opacity = "0";
+      setTimeout(() => el.remove(), 420);
+    });
+    _dstr.wash = null;
+    _dstr.float = null;
+    _dstr.inner = null;
+    _dstr.caption = null;
+    _dstr.questionId = null;
+  }
+
+  function _distractionCaptions(subject) {
+    const s = String(subject || "").trim() || "this";
+    return [
+      `${s} is still running in your head.`,
+      `Solve it while ${s} sits right here.`,
+      `Eyes on the question, not on ${s}.`,
+      `Every glance here costs you marks.`,
+      `${s} stays till you answer.`,
+      `Still looking? That's the problem.`,
+    ];
+  }
+
+  function _distractionDockSize(aspect) {
+    const vw = window.innerWidth || 1024;
+    const vh = window.innerHeight || 768;
+    const ratio = Number(aspect) > 0 ? Number(aspect) : 1.3;
+    let w = Math.max(170, Math.min(vw * 0.34, 320));
+    let h = w / ratio;
+    const maxH = vh * 0.4;
+    if (h > maxH) { h = maxH; w = h * ratio; }
+    if (w > vw * 0.72) { w = vw * 0.72; h = w / ratio; }
+    return { w: Math.round(w), h: Math.round(h) };
+  }
+
+  /**
+   * Slots the image can occupy. Edge slots sit almost opaque (hard to ignore);
+   * slots that overlap the question stay translucent so the text is still
+   * readable through them — annoying, not impossible.
+   */
+  function _distractionAnchors(w, h) {
+    const vw = window.innerWidth || 1024;
+    const vh = window.innerHeight || 768;
+    const pad = 14;
+    const maxX = Math.max(pad, vw - w - pad);
+    const maxY = Math.max(pad, vh - h - pad);
+    return [
+      { x: maxX,        y: Math.min(maxY, 84),  o: 0.92 },  // top-right
+      { x: maxX,        y: maxY * 0.52,         o: 0.88 },  // mid-right
+      { x: maxX,        y: maxY,                o: 0.92 },  // bottom-right
+      { x: pad,         y: maxY,                o: 0.9  },  // bottom-left
+      { x: pad,         y: maxY * 0.46,         o: 0.86 },  // mid-left
+      { x: maxX * 0.5,  y: maxY * 0.62,         o: 0.42 },  // over the options
+      { x: maxX * 0.6,  y: Math.min(maxY, 118), o: 0.5  },  // over the stem
+      { x: maxX * 0.3,  y: maxY * 0.3,          o: 0.46 },  // over the card body
+    ];
+  }
+
+  // 0 = warm-up, 1 = escalated, 2 = full pressure. Time since docking.
+  function _distractionPhase() {
+    const elapsed = Date.now() - (_dstr.startedAt || Date.now());
+    if (elapsed > 60000) return 2;
+    if (elapsed > 28000) return 1;
+    return 0;
+  }
+
+  function _placeDistraction() {
+    const el = _dstr.float;
+    if (!el) return;
+    const phase = _distractionPhase();
+    const grow = phase === 2 ? 1.22 : phase === 1 ? 1.1 : 1;
+    const w = Math.round(_dstr.baseW * grow);
+    const h = Math.round(_dstr.baseH * grow);
+    el.style.width = `${w}px`;
+    el.style.height = `${h}px`;
+
+    const anchors = _distractionAnchors(w, h);
+    const idx = ((_dstr.anchorIdx % anchors.length) + anchors.length) % anchors.length;
+    const a = anchors[idx];
+    const boost = phase === 2 ? 1.3 : phase === 1 ? 1.14 : 1;
+    el.style.transform = `translate3d(${Math.round(a.x)}px, ${Math.round(a.y)}px, 0) scale(1)`;
+    el.style.opacity = String(Math.min(a.o * boost, 0.96));
+
+    if (_dstr.wash) {
+      _dstr.wash.style.opacity = phase === 2 ? "0.2" : phase === 1 ? "0.15" : "0.1";
+    }
+  }
+
+  function _pulseDistraction() {
+    const inner = _dstr.inner;
+    if (!inner || _dstr.reduced) return;
+    inner.classList.remove("distraction-float__inner--pulse");
+    void inner.offsetWidth; // restart the animation
+    inner.classList.add("distraction-float__inner--pulse");
+    _dstr.timers.push(setTimeout(() => {
+      inner.classList.remove("distraction-float__inner--pulse");
+    }, 1250));
+  }
+
+  function _roamDistraction() {
+    if (!_dstr.float) return;
+    const anchorCount = _distractionAnchors(_dstr.baseW, _dstr.baseH).length;
+    let next = Math.floor(Math.random() * anchorCount);
+    if (next === _dstr.anchorIdx) next = (next + 1) % anchorCount;
+    _dstr.anchorIdx = next;
+    _dstr.moveCount += 1;
+
+    _placeDistraction();
+
+    if (_dstr.caption && _dstr.captions.length) {
+      _dstr.caption.textContent = _dstr.captions[_dstr.moveCount % _dstr.captions.length];
+    }
+    if (_dstr.moveCount % 3 === 0) _pulseDistraction();
+
+    const phase = _distractionPhase();
+    const gap = phase === 2 ? 3200 : phase === 1 ? 4600 : 6500;
+    _dstr.timers.push(setTimeout(_roamDistraction, gap));
+  }
+
+  /**
+   * Dock the distraction image on screen and keep it alive.
+   * @param {string} imgUrl  verified image URL
+   * @param {object} opts    { fromRect, aspect, subject }
+   */
+  function startPersistentDistraction(imgUrl, opts = {}) {
+    if (!imgUrl) return;
+    stopPersistentDistraction();
+
+    const fromRect = opts.fromRect || null;
+    const aspect = Number(opts.aspect) > 0
+      ? Number(opts.aspect)
+      : (fromRect && fromRect.height ? fromRect.width / fromRect.height : 1.3);
+
+    _dstr.reduced = Boolean(window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches);
+    _dstr.questionId = String(state.currentQuestionId || "");
+    _dstr.startedAt = Date.now();
+    _dstr.moveCount = 0;
+    _dstr.anchorIdx = 0;
+    _dstr.captions = _distractionCaptions(opts.subject);
+
+    // Quote-safe for CSS url() and for the innerHTML src attribute below.
+    const safeUrl = String(imgUrl).replace(/"/g, "%22");
+
+    // Layer 1 — blurred full-screen wash of the same image.
+    const wash = document.createElement("div");
+    wash.className = "distraction-wash";
+    wash.setAttribute("aria-hidden", "true");
+    wash.style.backgroundImage = `url("${safeUrl}")`;
+    document.body.appendChild(wash);
+    requestAnimationFrame(() => { wash.style.opacity = "0.1"; });
+    _dstr.wash = wash;
+
+    // Layer 2 — the docked image.
+    const size = _distractionDockSize(aspect);
+    _dstr.baseW = size.w;
+    _dstr.baseH = size.h;
+
+    const el = document.createElement("div");
+    el.className = "distraction-float";
+    el.setAttribute("aria-hidden", "true");
+    el.style.width = `${size.w}px`;
+    el.style.height = `${size.h}px`;
+    el.innerHTML = `
+      <div class="distraction-float__inner">
+        <img class="distraction-float__img" src="${safeUrl}" alt="" />
+        <div class="distraction-float__caption"></div>
+      </div>`;
+    document.body.appendChild(el);
+    _dstr.float = el;
+    _dstr.inner = el.querySelector(".distraction-float__inner");
+    _dstr.caption = el.querySelector(".distraction-float__caption");
+    if (_dstr.caption) _dstr.caption.textContent = _dstr.captions[0] || "";
+
+    const first = _distractionAnchors(size.w, size.h)[0];
+
+    // FLIP: start exactly where the zoomed popup image was, then shrink into
+    // the docked slot so it reads as "the image stayed on screen".
+    el.style.transition = "none";
+    if (fromRect && fromRect.width > 0) {
+      const scale0 = Math.max(0.2, fromRect.width / size.w);
+      el.style.transform = `translate3d(${Math.round(fromRect.left)}px, ${Math.round(fromRect.top)}px, 0) scale(${scale0})`;
+      el.style.opacity = "1";
+    } else {
+      el.style.transform = `translate3d(${Math.round(first.x)}px, ${Math.round(first.y)}px, 0) scale(1.06)`;
+      el.style.opacity = "0";
+    }
+    void el.offsetWidth; // commit the start state
+
+    el.style.transition = "transform 950ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity 850ms ease";
+    requestAnimationFrame(() => {
+      el.style.transform = `translate3d(${Math.round(first.x)}px, ${Math.round(first.y)}px, 0) scale(1)`;
+      el.style.opacity = String(first.o);
+    });
+    // Hand the transition back to the stylesheet once docking finishes.
+    _dstr.timers.push(setTimeout(() => { el.style.transition = ""; }, 1000));
+
+    // Self-destruct if the question moved on without us.
+    _dstr.timers.push(setInterval(() => {
+      if (String(state.currentQuestionId || "") !== _dstr.questionId) stopPersistentDistraction();
+    }, 1000));
+
+    _dstr.resizeHandler = () => {
+      const resized = _distractionDockSize(aspect);
+      _dstr.baseW = resized.w;
+      _dstr.baseH = resized.h;
+      _placeDistraction();
+    };
+    window.addEventListener("resize", _dstr.resizeHandler);
+
+    console.log(`[distraction] docked ${size.w}x${size.h} — url: ${String(imgUrl).substring(0, 60)}`);
+
+    if (_dstr.reduced) return; // static docked image, no roaming
+    _dstr.timers.push(setTimeout(_roamDistraction, 5200));
+  }
+  // ──────────────────────────────────────────────────────────────────────
+
 async function showQuestionWarningPopup(questionNumber, onComplete) {
     const qNum = Number(questionNumber || 1);
     const fallbackCopy = buildQuestionWarningFallbackCopy(qNum);
@@ -4262,10 +4515,46 @@ async function showQuestionWarningPopup(questionNumber, onComplete) {
 
     const reflEl = overlay.querySelector("#psyqReflection");
     const closeBtn = overlay.querySelector("#psyqClose");
+    const popupImgEl = overlay.querySelector(".psyq-katrina-image");
 
     if (reflEl) reflEl.textContent = resolvedCopy.headline || fallbackCopy.headline;
 
-    closeBtn?.addEventListener("click", () => dismissPsyqOverlay(overlay, onComplete));
+    // Closing the popup no longer removes the image — it docks it on screen
+    // so the student keeps solving with the distraction sitting right there.
+    const subject = summarizeDistractionTopic(
+      String(state.followupAnswers?.[0]?.answer || ""),
+      "your distraction"
+    );
+
+    let docked = false;
+    const dockAndClose = () => {
+      if (docked) return;
+      docked = true;
+      clearTimeout(autoDockId);
+
+      const liveImg = popupImgEl && popupImgEl.style.display !== "none" ? popupImgEl : null;
+      if (!imgUrl || !liveImg) {
+        dismissPsyqOverlay(overlay, onComplete);
+        return;
+      }
+
+      const rect = liveImg.getBoundingClientRect();
+      const aspect = liveImg.naturalWidth && liveImg.naturalHeight
+        ? liveImg.naturalWidth / liveImg.naturalHeight
+        : rect.width / Math.max(rect.height, 1);
+
+      // Remove the overlay instantly so the docking copy is seamless.
+      overlay.remove();
+      startPersistentDistraction(imgUrl, { fromRect: rect, aspect, subject });
+      onComplete?.();
+    };
+
+    closeBtn?.addEventListener("click", dockAndClose);
+
+    // Safety: the overlay swallows clicks, so never let it block the question
+    // forever. Auto-dock after the zoom has had time to land.
+    const autoDockId = setTimeout(dockAndClose, 7000);
+    pendingTriggerTimeouts.push(autoDockId);
   }
 
   function showPersonalizedQuiz(onComplete, opts = {}) {
@@ -7781,6 +8070,8 @@ async function showQuestionWarningPopup(questionNumber, onComplete) {
     
     // Clean up any active triggers from previous question
     deactivateAllTriggers();
+    // Retire the previous question's docked distraction image.
+    stopPersistentDistraction();
     
     state.currentQuestionId = question?.question_id || "";
     state.questionDifficulty = String(question?.difficulty || "");
@@ -8326,6 +8617,8 @@ async function showQuestionWarningPopup(questionNumber, onComplete) {
 
   function afterSubmit() {
     state.isSubmittingAnswer = false;
+    // The answer is in — the distraction has done its job for this question.
+    stopPersistentDistraction();
   }
 
   function noteAnswerOutcome(correct, hasAnswerKey) {
@@ -8439,6 +8732,7 @@ async function showQuestionWarningPopup(questionNumber, onComplete) {
     state.optionFeedbackInterceptionCount = 0;
     closeOptionFeedbackPopup();
     deactivateAllTriggers();
+    stopPersistentDistraction();
     // Clear distraction image cache so the next session fetches fresh images.
     clearImageCache();
   }
@@ -8649,6 +8943,8 @@ async function showQuestionWarningPopup(questionNumber, onComplete) {
     fetchDistractionImage,
     getImageCache: getImageCacheEntry,
     clearImageCache,
+    startPersistentDistraction,
+    stopPersistentDistraction,
     verifyImageUrl: _verifyImageUrl,
     // Focus selection cache for images (survives sessionStorage clearing)
     getCachedFocusSelection: () => _cachedFocusSelection,
@@ -10612,6 +10908,7 @@ async function showTestEndScreen(timeUsedMs) {
   // Kill all triggers completely
   if (StressTriggers) {
     if (StressTriggers.deactivateAllTriggers) StressTriggers.deactivateAllTriggers();
+    if (StressTriggers.stopPersistentDistraction) StressTriggers.stopPersistentDistraction();
     if (StressTriggers.stopExamTimer) StressTriggers.stopExamTimer();
   }
   
